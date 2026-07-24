@@ -1,0 +1,97 @@
+# Bouwt de twee frontends die de Nederlandse vertaling bevatten en pusht ze
+# naar GHCR. De rest van de stack (api, worker, live, proxy, admin) draait op
+# de officiele makeplane-images en hoeft hier niet gebouwd te worden.
+#
+# Alleen web en space hangen aan @plane/i18n. De locales worden bij de build
+# in de bundle gecompileerd via de dynamische import() in locales/index.ts,
+# dus een prebuilt image bevat het Nederlands niet.
+#
+# APP_RELEASE moet gelijk blijven aan de upstream-tag waar deze branch op
+# gebaseerd is, en aan APP_RELEASE in de Coolify-omgeving. Lopen die uit
+# elkaar, dan praat een frontend tegen een API van een andere versie.
+
+name: Build NL images
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - nl-v1.3.1
+    paths:
+      - "packages/**"
+      - "apps/web/**"
+      - "apps/space/**"
+      - ".github/workflows/build-nl-images.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  APP_RELEASE: v1.3.1
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: plane-frontend-nl
+            dockerfile: apps/web/Dockerfile.web
+          - name: plane-space-nl
+            dockerfile: apps/space/Dockerfile.space
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # De runner heeft ~14 GB vrij; een pnpm-install van deze monorepo plus
+      # twee build-stages komt daar dicht bij. Dit haalt ~10 GB aan
+      # voorgeinstalleerde SDK's weg die we niet gebruiken.
+      - name: Ruimte vrijmaken
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          df -h /
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Inloggen bij GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Bouwen en pushen
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/${{ matrix.name }}:${{ env.APP_RELEASE }}
+            ghcr.io/${{ github.repository_owner }}/${{ matrix.name }}:latest
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.name }}
+
+      - name: Controleren dat de vertaling in de image zit
+        if: matrix.name == 'plane-frontend-nl'
+        run: |
+          img="ghcr.io/${{ github.repository_owner }}/${{ matrix.name }}:${{ env.APP_RELEASE }}"
+          docker pull -q "$img"
+          cid=$(docker create "$img")
+          docker cp "$cid:/usr/share/nginx/html" ./html
+          docker rm -f "$cid" >/dev/null
+          # Faalt de build stil terug op Engels, dan staat deze string er niet in.
+          if grep -rq "Nieuw work item" ./html; then
+            echo "OK: Nederlandse strings aanwezig in de bundle"
+          else
+            echo "FOUT: geen Nederlandse strings gevonden in de gebouwde assets"
+            exit 1
+          fi
